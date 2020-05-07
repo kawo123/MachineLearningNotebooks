@@ -1,9 +1,9 @@
-# License Info: https://github.com/rapidsai/notebooks/blob/master/LICENSE
 import numpy as np
 import datetime
 import dask_xgboost as dxgb_gpu
 import dask
 import dask_cudf
+from dask_cuda import LocalCUDACluster
 from dask.delayed import delayed
 from dask.distributed import Client, wait
 import xgboost as xgb
@@ -15,81 +15,21 @@ from glob import glob
 import os
 import argparse
 
-parser = argparse.ArgumentParser("rapidssample")
-parser.add_argument("--data_dir", type=str, help="location of data")
-parser.add_argument("--num_gpu", type=int, help="Number of GPUs to use", default=1)
-parser.add_argument("--part_count", type=int, help="Number of data files to train against", default=2)
-parser.add_argument("--end_year", type=int, help="Year to end the data load", default=2000)
-parser.add_argument("--cpu_predictor", type=str, help="Flag to use CPU for prediction", default='False')
-parser.add_argument('-f', type=str, default='') # added for notebook execution scenarios
-args = parser.parse_args()
-data_dir = args.data_dir
-num_gpu = args.num_gpu
-part_count = args.part_count
-end_year = args.end_year
-cpu_predictor = args.cpu_predictor.lower() in ('yes', 'true', 't', 'y', '1')
-
-print('data_dir = {0}'.format(data_dir))
-print('num_gpu = {0}'.format(num_gpu))
-print('part_count = {0}'.format(part_count))
-part_count = part_count + 1 # adding one because the usage below is not inclusive
-print('end_year = {0}'.format(end_year))
-print('cpu_predictor = {0}'.format(cpu_predictor))
-
-import subprocess
-
-cmd = "hostname --all-ip-addresses"
-process = subprocess.Popen(cmd.split(), stdout=subprocess.PIPE)
-output, error = process.communicate()
-IPADDR = str(output.decode()).split()[0]
-print('IPADDR is {0}'.format(IPADDR))
-
-cmd = "/rapids/notebooks/utils/dask-setup.sh 0"
-process = subprocess.Popen(cmd.split(), stdout=subprocess.PIPE)
-output, error = process.communicate()
-
-cmd = "/rapids/notebooks/utils/dask-setup.sh rapids " + str(num_gpu) + " 8786 8787 8790 " + str(IPADDR) + " MASTER"
-process = subprocess.Popen(cmd.split(), stdout=subprocess.PIPE)
-output, error = process.communicate()
-
-print(output.decode())
-
-import dask
-from dask.delayed import delayed
-from dask.distributed import Client, wait
-
-_client = IPADDR + str(":8786")
-
-client = dask.distributed.Client(_client)
-
-def initialize_rmm_pool():
-    from librmm_cffi import librmm_config as rmm_cfg
-
-    rmm_cfg.use_pool_allocator = True
-    #rmm_cfg.initial_pool_size = 2<<30 # set to 2GiB. Default is 1/2 total GPU memory
-    import cudf
-    return cudf._gdf.rmm_initialize()
-
-def initialize_rmm_no_pool():
-    from librmm_cffi import librmm_config as rmm_cfg
-    
-    rmm_cfg.use_pool_allocator = False
-    import cudf
-    return cudf._gdf.rmm_initialize()
-
 def run_dask_task(func, **kwargs):
     task = func(**kwargs)
     return task
 
-def process_quarter_gpu(year=2000, quarter=1, perf_file=""):
+def process_quarter_gpu(client, col_names_path, acq_data_path, year=2000, quarter=1, perf_file=""):
+    dask_client = client
     ml_arrays = run_dask_task(delayed(run_gpu_workflow),
+                                          col_path=col_names_path,
+                                          acq_path=acq_data_path,
                                           quarter=quarter,
                                           year=year,
                                           perf_file=perf_file)
-    return client.compute(ml_arrays,
+    return dask_client.compute(ml_arrays,
                           optimize_graph=False,
-                          fifo_timeout="0ms"
-                         )
+                          fifo_timeout="0ms")
 
 def null_workaround(df, **kwargs):
     for column, data_type in df.dtypes.items():
@@ -99,9 +39,9 @@ def null_workaround(df, **kwargs):
             df[column] = df[column].fillna(-1)
     return df
 
-def run_gpu_workflow(quarter=1, year=2000, perf_file="", **kwargs):
-    names = gpu_load_names()
-    acq_gdf = gpu_load_acquisition_csv(acquisition_path= acq_data_path + "/Acquisition_"
+def run_gpu_workflow(col_path, acq_path, quarter=1, year=2000, perf_file="", **kwargs):
+    names = gpu_load_names(col_path=col_path)
+    acq_gdf = gpu_load_acquisition_csv(acquisition_path= acq_path + "/Acquisition_"
                                       + str(year) + "Q" + str(quarter) + ".txt")
     acq_gdf = acq_gdf.merge(names, how='left', on=['seller_name'])
     acq_gdf.drop_column('seller_name')
@@ -231,7 +171,7 @@ def gpu_load_acquisition_csv(acquisition_path, **kwargs):
     
     return cudf.read_csv(acquisition_path, names=cols, delimiter='|', dtype=list(dtypes.values()), skiprows=1)
 
-def gpu_load_names(**kwargs):
+def gpu_load_names(col_path):
     """ Loads names used for renaming the banks
     
     Returns
@@ -248,30 +188,30 @@ def gpu_load_names(**kwargs):
         ("new", "category"),
     ])
 
-    return cudf.read_csv(col_names_path, names=cols, delimiter='|', dtype=list(dtypes.values()), skiprows=1)
+    return cudf.read_csv(col_path, names=cols, delimiter='|', dtype=list(dtypes.values()), skiprows=1)
 
 def create_ever_features(gdf, **kwargs):
     everdf = gdf[['loan_id', 'current_loan_delinquency_status']]
-    everdf = everdf.groupby('loan_id', method='hash').max()
+    everdf = everdf.groupby('loan_id', method='hash').max().reset_index()
     del(gdf)
-    everdf['ever_30'] = (everdf['max_current_loan_delinquency_status'] >= 1).astype('int8')
-    everdf['ever_90'] = (everdf['max_current_loan_delinquency_status'] >= 3).astype('int8')
-    everdf['ever_180'] = (everdf['max_current_loan_delinquency_status'] >= 6).astype('int8')
-    everdf.drop_column('max_current_loan_delinquency_status')
+    everdf['ever_30'] = (everdf['current_loan_delinquency_status'] >= 1).astype('int8')
+    everdf['ever_90'] = (everdf['current_loan_delinquency_status'] >= 3).astype('int8')
+    everdf['ever_180'] = (everdf['current_loan_delinquency_status'] >= 6).astype('int8')
+    everdf.drop_column('current_loan_delinquency_status')
     return everdf
 
 def create_delinq_features(gdf, **kwargs):
     delinq_gdf = gdf[['loan_id', 'monthly_reporting_period', 'current_loan_delinquency_status']]
     del(gdf)
-    delinq_30 = delinq_gdf.query('current_loan_delinquency_status >= 1')[['loan_id', 'monthly_reporting_period']].groupby('loan_id', method='hash').min()
-    delinq_30['delinquency_30'] = delinq_30['min_monthly_reporting_period']
-    delinq_30.drop_column('min_monthly_reporting_period')
-    delinq_90 = delinq_gdf.query('current_loan_delinquency_status >= 3')[['loan_id', 'monthly_reporting_period']].groupby('loan_id', method='hash').min()
-    delinq_90['delinquency_90'] = delinq_90['min_monthly_reporting_period']
-    delinq_90.drop_column('min_monthly_reporting_period')
-    delinq_180 = delinq_gdf.query('current_loan_delinquency_status >= 6')[['loan_id', 'monthly_reporting_period']].groupby('loan_id', method='hash').min()
-    delinq_180['delinquency_180'] = delinq_180['min_monthly_reporting_period']
-    delinq_180.drop_column('min_monthly_reporting_period')
+    delinq_30 = delinq_gdf.query('current_loan_delinquency_status >= 1')[['loan_id', 'monthly_reporting_period']].groupby('loan_id', method='hash').min().reset_index()
+    delinq_30['delinquency_30'] = delinq_30['monthly_reporting_period']
+    delinq_30.drop_column('monthly_reporting_period')
+    delinq_90 = delinq_gdf.query('current_loan_delinquency_status >= 3')[['loan_id', 'monthly_reporting_period']].groupby('loan_id', method='hash').min().reset_index()
+    delinq_90['delinquency_90'] = delinq_90['monthly_reporting_period']
+    delinq_90.drop_column('monthly_reporting_period')
+    delinq_180 = delinq_gdf.query('current_loan_delinquency_status >= 6')[['loan_id', 'monthly_reporting_period']].groupby('loan_id', method='hash').min().reset_index()
+    delinq_180['delinquency_180'] = delinq_180['monthly_reporting_period']
+    delinq_180.drop_column('monthly_reporting_period')
     del(delinq_gdf)
     delinq_merge = delinq_30.merge(delinq_90, how='left', on=['loan_id'], type='hash')
     delinq_merge['delinquency_90'] = delinq_merge['delinquency_90'].fillna(np.dtype('datetime64[ms]').type('1970-01-01').astype('datetime64[ms]'))
@@ -324,16 +264,15 @@ def create_joined_df(gdf, everdf, **kwargs):
 def create_12_mon_features(joined_df, **kwargs):
     testdfs = []
     n_months = 12
+
     for y in range(1, n_months + 1):
         tmpdf = joined_df[['loan_id', 'timestamp_year', 'timestamp_month', 'delinquency_12', 'upb_12']]
         tmpdf['josh_months'] = tmpdf['timestamp_year'] * 12 + tmpdf['timestamp_month']
         tmpdf['josh_mody_n'] = ((tmpdf['josh_months'].astype('float64') - 24000 - y) / 12).floor()
-        tmpdf = tmpdf.groupby(['loan_id', 'josh_mody_n'], method='hash').agg({'delinquency_12': 'max','upb_12': 'min'})
-        tmpdf['delinquency_12'] = (tmpdf['max_delinquency_12']>3).astype('int32')
-        tmpdf['delinquency_12'] +=(tmpdf['min_upb_12']==0).astype('int32')
-        tmpdf.drop_column('max_delinquency_12')
-        tmpdf['upb_12'] = tmpdf['min_upb_12']
-        tmpdf.drop_column('min_upb_12')
+        tmpdf = tmpdf.groupby(['loan_id', 'josh_mody_n'], method='hash').agg({'delinquency_12': 'max','upb_12': 'min'}).reset_index()
+        tmpdf['delinquency_12'] = (tmpdf['delinquency_12']>3).astype('int32')
+        tmpdf['delinquency_12'] +=(tmpdf['upb_12']==0).astype('int32')
+        tmpdf['upb_12'] = tmpdf['upb_12']
         tmpdf['timestamp_year'] = (((tmpdf['josh_mody_n'] * n_months) + 24000 + (y - 1)) / 12).floor().astype('int16')
         tmpdf['timestamp_month'] = np.int8(y)
         tmpdf.drop_column('josh_mody_n')
@@ -374,6 +313,7 @@ def last_mile_cleaning(df, **kwargs):
         'delinquency_30', 'delinquency_90', 'delinquency_180', 'upb_12',
         'zero_balance_effective_date','foreclosed_after', 'disposition_date','timestamp'
     ]
+
     for column in drop_list:
         df.drop_column(column)
     for col, dtype in df.dtypes.iteritems():
@@ -384,117 +324,147 @@ def last_mile_cleaning(df, **kwargs):
     df['delinquency_12'] = df['delinquency_12'].fillna(False).astype('int32')
     for column in df.columns:
         df[column] = df[column].fillna(-1)
-    return df.to_arrow(index=False)
+    return df.to_arrow(preserve_index=False)
 
+def main():
+    parser = argparse.ArgumentParser("rapidssample")
+    parser.add_argument("--data_dir", type=str, help="location of data")
+    parser.add_argument("--num_gpu", type=int, help="Number of GPUs to use", default=1)
+    parser.add_argument("--part_count", type=int, help="Number of data files to train against", default=2)
+    parser.add_argument("--end_year", type=int, help="Year to end the data load", default=2000)
+    parser.add_argument("--cpu_predictor", type=str, help="Flag to use CPU for prediction", default='False')
+    parser.add_argument('-f', type=str, default='') # added for notebook execution scenarios
+    args = parser.parse_args()
+    data_dir = args.data_dir
+    num_gpu = args.num_gpu
+    part_count = args.part_count
+    end_year = args.end_year
+    cpu_predictor = args.cpu_predictor.lower() in ('yes', 'true', 't', 'y', '1')
 
-# to download data for this notebook, visit https://rapidsai.github.io/demos/datasets/mortgage-data and update the following paths accordingly
-acq_data_path = "{0}/acq".format(data_dir) #"/rapids/data/mortgage/acq"
-perf_data_path = "{0}/perf".format(data_dir) #"/rapids/data/mortgage/perf"
-col_names_path = "{0}/names.csv".format(data_dir) # "/rapids/data/mortgage/names.csv"
-start_year = 2000
-#end_year = 2000 # end_year is inclusive -- converted to parameter
-#part_count = 2 # the number of data files to train against -- converted to parameter
+    if cpu_predictor:
+        print('Training with CPUs require num gpu = 1')
+        num_gpu = 1
 
-client.run(initialize_rmm_pool)
+    print('data_dir = {0}'.format(data_dir))
+    print('num_gpu = {0}'.format(num_gpu))
+    print('part_count = {0}'.format(part_count))
+    print('end_year = {0}'.format(end_year))
+    print('cpu_predictor = {0}'.format(cpu_predictor))
+    
+    import subprocess
 
-# NOTE: The ETL calculates additional features which are then dropped before creating the XGBoost DMatrix.
-# This can be optimized to avoid calculating the dropped features.
-print("Reading ...")
-t1 = datetime.datetime.now()
-gpu_dfs = []
-gpu_time = 0
-quarter = 1
-year = start_year
-count = 0
-while year <= end_year:
-    for file in glob(os.path.join(perf_data_path + "/Performance_" + str(year) + "Q" + str(quarter) + "*")):
-        if count < part_count:
-            gpu_dfs.append(process_quarter_gpu(year=year, quarter=quarter, perf_file=file))
-            count += 1
-            print('file: {0}'.format(file))
-            print('count: {0}'.format(count))
-    quarter += 1
-    if quarter == 5:
-        year += 1
-        quarter = 1
+    cmd = "hostname --all-ip-addresses"
+    process = subprocess.Popen(cmd.split(), stdout=subprocess.PIPE)
+    output, error = process.communicate()
+    IPADDR = str(output.decode()).split()[0]
+    
+    cluster = LocalCUDACluster(ip=IPADDR,n_workers=num_gpu)
+    client = Client(cluster)
+    client
+    print(client.ncores())
+
+    # to download data for this notebook, visit https://rapidsai.github.io/demos/datasets/mortgage-data and update the following paths accordingly
+    acq_data_path = "{0}/acq".format(data_dir) #"/rapids/data/mortgage/acq"
+    perf_data_path = "{0}/perf".format(data_dir) #"/rapids/data/mortgage/perf"
+    col_names_path = "{0}/names.csv".format(data_dir) # "/rapids/data/mortgage/names.csv"
+    start_year = 2000
+
+    client
+    print('--->>> Workers used: {0}'.format(client.ncores()))
+
+    # NOTE: The ETL calculates additional features which are then dropped before creating the XGBoost DMatrix.
+    # This can be optimized to avoid calculating the dropped features.
+    print("Reading ...")
+    t1 = datetime.datetime.now()
+    gpu_dfs = []
+    gpu_time = 0
+    quarter = 1
+    year = start_year
+    count = 0
+    while year <= end_year:
+        for file in glob(os.path.join(perf_data_path + "/Performance_" + str(year) + "Q" + str(quarter) + "*")):
+            if count < part_count:
+                gpu_dfs.append(process_quarter_gpu(client, col_names_path, acq_data_path, year=year, quarter=quarter, perf_file=file))
+                count += 1
+                print('file: {0}'.format(file))
+                print('count: {0}'.format(count))
+        quarter += 1
+        if quarter == 5:
+            year += 1
+            quarter = 1
+            
+    wait(gpu_dfs)
+    t2 = datetime.datetime.now()
+    print("Reading time: {0}".format(str(t2-t1)))
+    print('--->>> Number of data parts: {0}'.format(len(gpu_dfs)))
+
+    dxgb_gpu_params = {
+        'nround':            100,
+        'max_depth':         8,
+        'max_leaves':        2**8,
+        'alpha':             0.9,
+        'eta':               0.1,
+        'gamma':             0.1,
+        'learning_rate':     0.1,
+        'subsample':         1,
+        'reg_lambda':        1,
+        'scale_pos_weight':  2,
+        'min_child_weight':  30,
+        'tree_method':       'gpu_hist',
+        'n_gpus':            1, 
+        'distributed_dask':  True,
+        'loss':              'ls',
+        'objective':         'reg:squarederror',
+        'max_features':      'auto',
+        'criterion':         'friedman_mse',
+        'grow_policy':       'lossguide',
+        'verbose':           True
+    }
+      
+    if cpu_predictor:
+        print('\n---->>>> Training using CPUs <<<<----\n')
+        dxgb_gpu_params['predictor'] = 'cpu_predictor'
+        dxgb_gpu_params['tree_method'] = 'hist'
+        dxgb_gpu_params['objective'] = 'reg:linear'
         
-wait(gpu_dfs)
-t2 = datetime.datetime.now()
-print("Reading time ...")
-print(t2-t1)
-print('len(gpu_dfs) is {0}'.format(len(gpu_dfs)))
-
-client.run(cudf._gdf.rmm_finalize)
-client.run(initialize_rmm_no_pool)
-
-dxgb_gpu_params = {
-    'nround':            100,
-    'max_depth':         8,
-    'max_leaves':        2**8,
-    'alpha':             0.9,
-    'eta':               0.1,
-    'gamma':             0.1,
-    'learning_rate':     0.1,
-    'subsample':         1,
-    'reg_lambda':        1,
-    'scale_pos_weight':  2,
-    'min_child_weight':  30,
-    'tree_method':       'gpu_hist',
-    'n_gpus':            1, 
-    'distributed_dask':  True,
-    'loss':              'ls',
-    'objective':         'gpu:reg:linear',
-    'max_features':      'auto',
-    'criterion':         'friedman_mse',
-    'grow_policy':       'lossguide',
-    'verbose':           True
-}
-  
-if cpu_predictor:
-    print('Training using CPUs')
-    dxgb_gpu_params['predictor'] = 'cpu_predictor'
-    dxgb_gpu_params['tree_method'] = 'hist'
-    dxgb_gpu_params['objective'] = 'reg:linear'
-    
-else:
-    print('Training using GPUs')
-
-print('Training parameters are {0}'.format(dxgb_gpu_params))
-
-gpu_dfs = [delayed(DataFrame.from_arrow)(gpu_df) for gpu_df in gpu_dfs[:part_count]]
-    
-gpu_dfs = [gpu_df for gpu_df in gpu_dfs]
-
-wait(gpu_dfs)
-tmp_map = [(gpu_df, list(client.who_has(gpu_df).values())[0]) for gpu_df in gpu_dfs]
-new_map = {}
-for key, value in tmp_map:
-    if value not in new_map:
-        new_map[value] = [key]
     else:
-        new_map[value].append(key)
+        print('\n---->>>> Training using GPUs <<<<----\n')
+    
+    print('Training parameters are {0}'.format(dxgb_gpu_params))
+    
+    gpu_dfs = [delayed(DataFrame.from_arrow)(gpu_df) for gpu_df in gpu_dfs[:part_count]]
+    gpu_dfs = [gpu_df for gpu_df in gpu_dfs]
+    wait(gpu_dfs)
+    
+    tmp_map = [(gpu_df, list(client.who_has(gpu_df).values())[0]) for gpu_df in gpu_dfs]
+    new_map = {}
+    for key, value in tmp_map:
+        if value not in new_map:
+            new_map[value] = [key]
+        else:
+            new_map[value].append(key)
+    
+    del(tmp_map)
+    gpu_dfs = []
+    for list_delayed in new_map.values():
+        gpu_dfs.append(delayed(cudf.concat)(list_delayed))
+    
+    del(new_map)
+    gpu_dfs = [(gpu_df[['delinquency_12']], gpu_df[delayed(list)(gpu_df.columns.difference(['delinquency_12']))]) for gpu_df in gpu_dfs]
+    gpu_dfs = [(gpu_df[0].persist(), gpu_df[1].persist()) for gpu_df in gpu_dfs]
+    
+    gpu_dfs = [dask.delayed(xgb.DMatrix)(gpu_df[1], gpu_df[0]) for gpu_df in gpu_dfs]
+    gpu_dfs = [gpu_df.persist() for gpu_df in gpu_dfs]
+    gc.collect()
+    wait(gpu_dfs)
 
-del(tmp_map)
-gpu_dfs = []
-for list_delayed in new_map.values():
-    gpu_dfs.append(delayed(cudf.concat)(list_delayed))
+    # TRAIN THE MODEL
+    labels = None
+    t1 = datetime.datetime.now()
+    bst = dxgb_gpu.train(client, dxgb_gpu_params, gpu_dfs, labels, num_boost_round=dxgb_gpu_params['nround'])
+    t2 = datetime.datetime.now()
+    print('\n---->>>> Training time: {0} <<<<----\n'.format(str(t2-t1)))
+    print('Exiting script')
 
-del(new_map)
-gpu_dfs = [(gpu_df[['delinquency_12']], gpu_df[delayed(list)(gpu_df.columns.difference(['delinquency_12']))]) for gpu_df in gpu_dfs]
-gpu_dfs = [(gpu_df[0].persist(), gpu_df[1].persist()) for gpu_df in gpu_dfs]
-gpu_dfs = [dask.delayed(xgb.DMatrix)(gpu_df[1], gpu_df[0]) for gpu_df in gpu_dfs]
-gpu_dfs = [gpu_df.persist() for gpu_df in gpu_dfs]
-
-gc.collect()
-labels = None
-
-print('str(gpu_dfs) is {0}'.format(str(gpu_dfs)))
-
-wait(gpu_dfs)
-t1 = datetime.datetime.now()
-bst = dxgb_gpu.train(client, dxgb_gpu_params, gpu_dfs, labels, num_boost_round=dxgb_gpu_params['nround'])
-t2 = datetime.datetime.now()
-print("Training time ...")
-print(t2-t1)
-print('str(bst) is {0}'.format(str(bst)))
-print('Exiting script')
+if __name__ == '__main__':
+    main()

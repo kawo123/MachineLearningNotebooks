@@ -36,16 +36,14 @@ Azure Machine Learning Pipelines optimize for simplicity, speed, and efficiency.
 
 In this directory, there are two types of notebooks: 
 
-* The first type of notebooks will introduce you to core Azure Machine Learning Pipelines features. These notebooks below belong in this category, and are designed to go in sequence; they're all located in the "intro-to-pipelines" folder:
-
-1. [aml-pipelines-getting-started.ipynb](https://aka.ms/pl-get-started)
-2. [aml-pipelines-with-data-dependency-steps.ipynb](https://aka.ms/pl-data-dep)
-3. [aml-pipelines-publish-and-run-using-rest-endpoint.ipynb](https://aka.ms/pl-pub-rep)
-4. [aml-pipelines-data-transfer.ipynb](https://aka.ms/pl-data-trans)
-5. [aml-pipelines-use-databricks-as-compute-target.ipynb](https://aka.ms/pl-databricks)
-6. [aml-pipelines-use-adla-as-compute-target.ipynb](https://aka.ms/pl-adla)
+* The first type of notebooks will introduce you to core Azure Machine Learning Pipelines features. Notebooks in this category are designed to go in sequence; they're all located in the [intro-to-pipelines](./intro-to-pipelines/) folder.
 
 * The second type of notebooks illustrate more sophisticated scenarios, and are independent of each other. These notebooks include:
 
-1. [pipeline-batch-scoring.ipynb](https://aka.ms/pl-batch-score)
-2. [pipeline-style-transfer.ipynb](https://aka.ms/pl-style-trans)
+1. [pipeline-batch-scoring.ipynb](https://aka.ms/pl-batch-score): This notebook demonstrates how to run a batch scoring job using Azure Machine Learning pipelines.
+2. [pipeline-style-transfer.ipynb](https://aka.ms/pl-style-trans): This notebook demonstrates a multi-step pipeline that uses GPU compute. This sample also showcases how to use conda dependencies using runconfig when using Pipelines.
+3. [nyc-taxi-data-regression-model-building.ipynb](https://aka.ms/pl-nyctaxi-tutorial): This notebook is an AzureML Pipelines version of the previously published two part sample.
+4. [file-dataset-image-inference-mnist.ipynb](https://aka.ms/pl-pr-filedata): This notebook demonstrates how to use ParallelRunStep to process unstructured data (file dataset).
+5. [tabular-dataset-inference-iris.ipynb](https://aka.ms/pl-pr-tabulardata): This notebook demonstrates how to use ParallelRunStep to process structured data (tabular dataset).
+
+ ![Impressions](https://PixelServer20190423114238.azurewebsites.net/api/impressions/MachineLearningNotebooks/how-to-use-azureml/machine-learning-pipelines/README.png)
